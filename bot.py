@@ -1773,8 +1773,8 @@ Python:    {PY_VER}
 4️⃣ SCRIPT MANAGEMENT
    Scripts aktif:
 {rs}
-   [STOP_SCRIPT: script_id]
-   [STOP_ALL_SCRIPTS]
+   ⚠️ STOP scripts hanya boleh dilakukan melalui /stop atau /new.
+   JANGAN guna marker [STOP_SCRIPT:] atau [STOP_ALL_SCRIPTS] — ia dilumpuhkan.
 
 5️⃣ SUB-AGENT SYSTEM
    Kau boleh delegasi tugas kepada sub-agents:
@@ -1931,7 +1931,7 @@ async def _process(bot, cid: int, session: Session, user_content: str):
     _sent_paths: set[str] = set()
 
     # Helper — always passes session for live display tree
-    _live = lambda s="": _live(s, session)
+    _live = lambda s="": _think(s, session)
 
     try:
         uid = session.uid
@@ -2029,15 +2029,9 @@ async def _process(bot, cid: int, session: Session, user_content: str):
                         memory_mgr.append_file_memory(parts[0].strip(), parts[1].strip())
 
                 # ── Process STOP commands ─────────────────────
-                stop_all, stop_ids = _extract_stops(resp)
-                if stop_all:
-                    stopped = _stop_all_scripts()
-                    mid = await _edit(bot, cid, mid, _live(f"⛔ Stopped {len(stopped)} scripts"))
-                    memory_mgr.log_message(uid, "user", f"[System] Stopped all scripts: {', '.join(stopped)}")
-                for sid in stop_ids:
-                    ok = _stop_script(sid)
-                    memory_mgr.log_message(uid, "user",
-                        f"[System] {'Stopped' if ok else 'Not found'} script {sid}")
+                # NOTE: AI markers [STOP_ALL_SCRIPTS] dan [STOP_SCRIPT:] dilumpuhkan.
+                # Hanya /stop dan /new boleh hentikan scripts.
+                # (Marker masih diparsed oleh _extract_stops & dibersihkan oleh _clean_text)
 
                 # ── Folder operations ─────────────────────────
                 _protected_only = {"uploads", ".scripts"}
@@ -2467,13 +2461,6 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
   📁 File management + GoFile upload
   🔄 Auto-restart (cron every 5hr)
 
-⌨️ <b>COMMANDS:</b>
-  /start — Admin panel
-  /stop — Hentikan AI
-  /scripts — Senarai scripts
-  /new — Sesi baru
-  /memory — Status memory
-
 {CREDIT}"""
 
     else:
@@ -2482,7 +2469,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         is_member = await check_channel_member(ctx.bot, uid)
         if not is_member:
             await update.message.reply_text(
-                "⛔ <b>Sila join channel kami dulu untuk guna bot ini.</b>",
+                _bq("⛔ <b>Sila join channel kami dulu untuk guna bot ini.</b>"),
                 parse_mode=ParseMode.HTML,
                 reply_markup=_join_channel_kb(),
             )
@@ -2514,15 +2501,23 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
   📌 Reply mana-mana mesej + tulis "pin" untuk simpan
   🧠 AI ingat semua perbualan anda
 
-⌨️ <b>COMMANDS:</b>
-  /start — Tunjuk status
-  /stop — Hentikan AI
-  /new — Sesi baru
-  /memory — Status memory anda
-
 {CREDIT}"""
 
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+    # Build inline keyboard buttons (ganti text commands)
+    if _is_owner(update):
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("⛔ Hentikan AI", callback_data="cmd_stop"),
+             InlineKeyboardButton("📋 Scripts", callback_data="cmd_scripts")],
+            [InlineKeyboardButton("🔄 Sesi Baru", callback_data="cmd_new"),
+             InlineKeyboardButton("💾 Memory", callback_data="cmd_memory")],
+        ])
+    else:
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("⛔ Hentikan AI", callback_data="cmd_stop"),
+             InlineKeyboardButton("🔄 Sesi Baru", callback_data="cmd_new")],
+            [InlineKeyboardButton("💾 Memory", callback_data="cmd_memory")],
+        ])
+    await update.message.reply_text(_bq(text), parse_mode=ParseMode.HTML, reply_markup=kb)
 
 
 async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2535,10 +2530,10 @@ async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("▶️ Teruskan", callback_data="stop_cancel"),
         ]])
         await update.message.reply_text(
-            "🧠 AI sedang memproses.\n\nAdakah anda pasti mahu hentikan?",
-            reply_markup=kb)
+            _bq("🧠 AI sedang memproses.\n\nAdakah anda pasti mahu hentikan?"),
+            parse_mode=ParseMode.HTML, reply_markup=kb)
     else:
-        await update.message.reply_text("ℹ️ AI tidak sedang berjalan.")
+        await update.message.reply_text(_bq("ℹ️ AI tidak sedang berjalan."), parse_mode=ParseMode.HTML)
 
 
 async def cmd_new(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2553,10 +2548,10 @@ async def cmd_new(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if _is_owner(update):
         _stop_all_scripts()
     await update.message.reply_text(
-        "🔄 <b>Sesi baru dimulakan.</b>\n\n"
+        _bq("🔄 <b>Sesi baru dimulakan.</b>\n\n"
         "💾 Memori kekal disimpan.\n"
         "🗑️ Conversation log dikosongkan.\n\n"
-        "Sila mulakan perbualan baru!",
+        "Sila mulakan perbualan baru!"),
         parse_mode=ParseMode.HTML)
 
 
@@ -2564,32 +2559,23 @@ async def cmd_scripts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _is_owner(update):
         return
     with _scripts_lock:
-        entries = list(_scripts.values())
+        entries = [e for e in _scripts.values() if e.status == "running"]
 
     if not entries:
-        await update.message.reply_text("📋 Tiada scripts dalam rekod.")
+        await update.message.reply_text(
+            _bq("📋 Tiada scripts aktif."), parse_mode=ParseMode.HTML)
         return
 
     entries.sort(key=lambda e: e.started, reverse=True)
-    lines = ["📋 <b>Scripts</b>\n"]
-    icons = {"running": "🟢", "done": "✅", "error": "❌", "stopped": "⛔", "pending": "⏳"}
+    lines = [f"📋 <b>Scripts Aktif ({len(entries)})</b>\n"]
     for e in entries[:30]:
-        icon = icons.get(e.status, "❓")
         dur = ""
         if e.started:
-            end = e.ended or datetime.datetime.now()
-            dur = f" ({int((end - e.started).total_seconds())}s)"
-        lines.append(f"{icon} <code>{e.sid}</code> {esc(e.name[:30])} [{e.lang}]{dur}")
+            dur = f" ({int((datetime.datetime.now() - e.started).total_seconds())}s)"
+        lines.append(f"🟢 <code>{e.sid}</code> {esc(e.name[:30])} [{e.lang}]{dur}")
 
-    kb = None
-    running = [e for e in entries if e.status == "running"]
-    if running:
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("⛔ Stop All", callback_data="stop_all_scripts")
-        ]])
-
-    await update.message.reply_text("\n".join(lines),
-                                     parse_mode=ParseMode.HTML, reply_markup=kb)
+    await update.message.reply_text(_bq("\n".join(lines)),
+                                     parse_mode=ParseMode.HTML)
 
 
 async def cmd_memory(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2625,7 +2611,7 @@ async def cmd_memory(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         InlineKeyboardButton("🗑 Clear Session Log", callback_data="mem_clear_log"),
         InlineKeyboardButton("📌 Clear Pins", callback_data="mem_clear_pins"),
     ]])
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    await update.message.reply_text(_bq(text), parse_mode=ParseMode.HTML, reply_markup=kb)
 
 
 # ── Callback Handler ──────────────────────────────────────────
@@ -2643,8 +2629,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         is_member = await check_channel_member(ctx.bot, uid)
         if is_member:
             await q.edit_message_text(
-                "✅ <b>Terima kasih! Anda dah join.</b>\n\n"
-                "Sila hantar mesej untuk mula berbual dengan AI.",
+                _bq("✅ <b>Terima kasih! Anda dah join.</b>\n\n"
+                "Sila hantar mesej untuk mula berbual dengan AI."),
                 parse_mode=ParseMode.HTML,
             )
         else:
@@ -2657,31 +2643,107 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         # Only owner stops all scripts
         if uid == OWNER_ID:
             _stop_all_scripts()
-            await q.edit_message_text("⛔ <b>AI dihentikan.</b> Semua scripts stopped.",
+            await q.edit_message_text(_bq("⛔ <b>AI dihentikan.</b> Semua scripts stopped."),
                                        parse_mode=ParseMode.HTML)
         else:
-            await q.edit_message_text("⛔ <b>AI dihentikan.</b>",
+            await q.edit_message_text(_bq("⛔ <b>AI dihentikan.</b>"),
                                        parse_mode=ParseMode.HTML)
 
     elif data == "stop_cancel":
-        await q.edit_message_text("▶️ AI diteruskan.")
+        await q.edit_message_text(_bq("▶️ AI diteruskan."), parse_mode=ParseMode.HTML)
 
     elif data == "stop_all_scripts":
-        if uid != OWNER_ID:
-            await q.answer("⛔ Owner sahaja boleh stop scripts.", show_alert=True)
-            return
-        stopped = _stop_all_scripts()
-        await q.edit_message_text(f"⛔ {len(stopped)} scripts dihentikan.",
-                                   parse_mode=ParseMode.HTML)
+        # Dilumpuhkan — hanya /stop dan /new boleh hentikan scripts
+        await q.answer("ℹ️ Gunakan /stop atau /new untuk hentikan scripts.", show_alert=True)
 
     elif data == "mem_clear_log":
         memory_mgr.reset_session(uid)
-        await q.edit_message_text("🗑 Session log dikosongkan.")
+        await q.edit_message_text(_bq("🗑 Session log dikosongkan."), parse_mode=ParseMode.HTML)
+
+    elif data == "cmd_stop":
+        session = _sess(uid)
+        if session.busy:
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("⛔ Ya, hentikan", callback_data="stop_confirm"),
+                InlineKeyboardButton("▶️ Teruskan", callback_data="stop_cancel"),
+            ]])
+            await q.edit_message_text(
+                _bq("🧠 AI sedang memproses.\n\nAdakah anda pasti mahu hentikan?"),
+                parse_mode=ParseMode.HTML, reply_markup=kb)
+        else:
+            await q.edit_message_text(
+                _bq("ℹ️ AI tidak sedang berjalan."), parse_mode=ParseMode.HTML)
+
+    elif data == "cmd_new":
+        session = _sess(uid)
+        if session.busy:
+            session.cancel_event.set()
+            await asyncio.sleep(1)
+        memory_mgr.reset_session(uid)
+        if uid == OWNER_ID:
+            _stop_all_scripts()
+        await q.edit_message_text(
+            _bq("🔄 <b>Sesi baru dimulakan.</b>\n\n"
+            "💾 Memori kekal disimpan.\n"
+            "🗑️ Conversation log dikosongkan.\n\n"
+            "Sila mulakan perbualan baru!"),
+            parse_mode=ParseMode.HTML)
+
+    elif data == "cmd_scripts":
+        if uid != OWNER_ID:
+            await q.answer("⛔ Owner sahaja.", show_alert=True)
+            return
+        with _scripts_lock:
+            entries = [e for e in _scripts.values() if e.status == "running"]
+        if not entries:
+            await q.edit_message_text(
+                _bq("📋 Tiada scripts aktif."), parse_mode=ParseMode.HTML)
+        else:
+            entries.sort(key=lambda e: e.started, reverse=True)
+            lines = [f"📋 <b>Scripts Aktif ({len(entries)})</b>\n"]
+            for e in entries[:30]:
+                dur = ""
+                if e.started:
+                    dur = f" ({int((datetime.datetime.now() - e.started).total_seconds())}s)"
+                lines.append(f"🟢 <code>{e.sid}</code> {esc(e.name[:30])} [{e.lang}]{dur}")
+            await q.edit_message_text(
+                _bq("\n".join(lines)), parse_mode=ParseMode.HTML)
+
+    elif data == "cmd_memory":
+        stats = memory_mgr.get_memory_stats(uid)
+        memories = memory_mgr.query_memory(uid)
+        pinned = memory_mgr.get_pinned(uid)
+        text = f"""💾 <b>Memory Status</b>
+━━━━━━━━━━━━━━━━━━━
+
+📊 <b>Statistics:</b>
+  DB entries:  {stats['db_entries']}
+  Pinned:      {stats['pinned']}
+  Log entries: {stats['log_entries']}
+  Summaries:   {stats['summaries']}
+  File memory: {stats['files']} files
+  RAG engine:  {'✅ Active' if HAS_RAG else '❌ Not available'}
+
+"""
+        if pinned:
+            text += "📌 <b>Pinned Messages:</b>\n"
+            for p in pinned[:10]:
+                text += f"  • {esc(p[:100])}\n"
+            text += "\n"
+        if memories:
+            text += "🧠 <b>Recent Memories:</b>\n"
+            for m in memories[:15]:
+                text += f"  [{m['category']}] {esc(m['key'])}: {esc(m['value'][:80])}\n"
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🗑 Clear Session Log", callback_data="mem_clear_log"),
+            InlineKeyboardButton("📌 Clear Pins", callback_data="mem_clear_pins"),
+        ]])
+        await q.edit_message_text(_bq(text), parse_mode=ParseMode.HTML, reply_markup=kb)
 
     elif data == "mem_clear_pins":
         with sqlite3.connect(str(DB_PATH)) as conn:
             conn.execute("DELETE FROM pinned_messages WHERE user_id=?", (uid,))
-        await q.edit_message_text("📌 Semua pins dipadamkan.")
+        await q.edit_message_text(_bq("📌 Semua pins dipadamkan."), parse_mode=ParseMode.HTML)
 
 
 
@@ -2703,7 +2765,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         is_member = await check_channel_member(ctx.bot, uid)
         if not is_member:
             await update.message.reply_text(
-                "⛔ <b>Sila join channel kami dulu untuk guna bot ini.</b>",
+                _bq("⛔ <b>Sila join channel kami dulu untuk guna bot ini.</b>"),
                 parse_mode=ParseMode.HTML,
                 reply_markup=_join_channel_kb(),
             )
@@ -2720,7 +2782,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         reply_text = update.message.reply_to_message.text or ""
         if reply_text:
             memory_mgr.pin_message(uid, reply_text[:2000], "user")
-            await update.message.reply_text("📌 Mesej di-pin!", parse_mode=ParseMode.HTML)
+            await update.message.reply_text(_bq("📌 Mesej di-pin!"), parse_mode=ParseMode.HTML)
             return
 
     # Extract reply context
@@ -2749,17 +2811,15 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             lower = text.strip().lower()
             if any(sw in lower for sw in _stop_words):
                 session.cancel_event.set()
-                stopped = _stop_all_scripts()
-                n = len(stopped)
                 await update.message.reply_text(
-                    f"⛔ <b>Menghentikan semua proses...</b>"
-                    + (f"\n🛑 {n} script dihentikan." if n else ""),
+                    _bq("⛔ <b>Menghentikan AI proses...</b>\n"
+                    "ℹ️ Scripts tidak dihentikan. Guna /stop atau /new untuk hentikan scripts."),
                     parse_mode=ParseMode.HTML,
                 )
                 return
             await update.message.reply_text(
-                "⏳ AI sedang memproses. Sila tunggu, hantar /stop, "
-                "atau taip <b>\"matikan\"</b> untuk hentikan.",
+                _bq("⏳ AI sedang memproses. Sila tunggu, hantar /stop, "
+                "atau taip <b>\"matikan\"</b> untuk hentikan."),
                 parse_mode=ParseMode.HTML,
             )
             return
@@ -2782,7 +2842,7 @@ async def on_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         is_member = await check_channel_member(ctx.bot, uid)
         if not is_member:
             await update.message.reply_text(
-                "⛔ <b>Sila join channel kami dulu untuk guna bot ini.</b>",
+                _bq("⛔ <b>Sila join channel kami dulu untuk guna bot ini.</b>"),
                 parse_mode=ParseMode.HTML,
                 reply_markup=_join_channel_kb(),
             )
@@ -2796,7 +2856,7 @@ async def on_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             session.cancel_event.clear()
         else:
             await update.message.reply_text(
-                "⏳ AI sedang memproses. Sila tunggu atau guna /stop.",
+                _bq("⏳ AI sedang memproses. Sila tunggu atau guna /stop."),
                 parse_mode=ParseMode.HTML,
             )
             return
@@ -2910,7 +2970,7 @@ async def _auto_restart_watcher(app: Application):
             try:
                 await app.bot.send_message(
                     chat_id=OWNER_ID,
-                    text=(
+                    text=_bq(
                         "🔄 <b>Auto-restart dalam 35s...</b>\n\n"
                         f"⏱ Uptime: {int(elapsed)}s\n"
                         "💾 Menyimpan state...\n"
