@@ -1487,9 +1487,23 @@ def _clean_text(text):
 def _bq(text):
     return f"<blockquote>{text}</blockquote>"
 
-def _think(status=""):
-    base = "🧠 <b>AI sedang berfikir...</b>"
-    return f"{base}\n{status}" if status else base
+def _think(status="", session=None):
+    """Generate thinking display — with optional live task tree."""
+    lines = ["🧠 <b>AI sedang berfikir...</b>"]
+    if status:
+        lines.append(status)
+    if session and (session.task_desc or session.live_items):
+        lines.append("")
+        if session.task_desc:
+            lines.append(f"📋 <b>Task:</b> {esc(session.task_desc)}")
+        for item in session.live_items:
+            t_icon = "🤖" if item.get("type") == "sub" else "⚡"
+            lines.append(
+                f"  {t_icon} <code>{item['id']}</code> "
+                f"<b>{esc(item['name'])}</b> — "
+                f"{item['icon']} {item['status']}"
+            )
+    return "\n".join(lines)
 
 async def _send(bot, cid, text, **kw):
     wrapped = _bq(text)
@@ -1667,6 +1681,8 @@ class Session:
         self.busy = False
         self.cancel_event = asyncio.Event()
         self.busy_since = 0.0
+        self.live_items: list[dict] = []   # Live display items
+        self.task_desc: str = ""           # Current task description
 
     def is_stale_busy(self, max_seconds=300):
         if not self.busy:
@@ -1858,11 +1874,28 @@ Rules:
         return f"[SUB-AGENT ERROR for: {task[:100]}] {e}"
 
 
-async def run_sub_agents_parallel(tasks: list, context: str = "", uid: int = 0) -> str:
-    """Run multiple sub-agents in parallel and return combined results."""
+async def run_sub_agents_parallel(
+    tasks: list, context: str = "", uid: int = 0,
+    on_progress=None,
+) -> str:
+    """Run multiple sub-agents in parallel with optional progress callback."""
     if not tasks:
         return ""
-    coros = [run_sub_agent(t, context, uid) for t in tasks]
+
+    async def _run_one(idx: int, task: str) -> str:
+        if on_progress:
+            await on_progress(idx, "start")
+        try:
+            result = await run_sub_agent(task, context, uid)
+            if on_progress:
+                await on_progress(idx, "done")
+            return result
+        except Exception as e:
+            if on_progress:
+                await on_progress(idx, "error", str(e))
+            return f"[SUB-AGENT ERROR] {e}"
+
+    coros = [_run_one(i, t) for i, t in enumerate(tasks)]
     results = await asyncio.gather(*coros, return_exceptions=True)
     parts = []
     for r in results:
@@ -1893,7 +1926,12 @@ async def _process(bot, cid: int, session: Session, user_content: str):
     session.busy = True
     session.cancel_event.clear()
     session.busy_since = time.time()
+    session.task_desc = user_content[:60].replace("\n", " ")
+    session.live_items = []
     _sent_paths: set[str] = set()
+
+    # Helper — always passes session for live display tree
+    _live = lambda s="": _live(s, session)
 
     try:
         uid = session.uid
@@ -1911,7 +1949,7 @@ async def _process(bot, cid: int, session: Session, user_content: str):
             memory_mgr.save_summary(uid, summary, len(recent) - 10)
             memory_mgr.clear_old_log(uid, keep_last=10)
 
-        m = await _send(bot, cid, _think())
+        m = await _send(bot, cid, _live())
         mid = m.message_id if m else None
 
         itr = 0
@@ -1945,16 +1983,16 @@ async def _process(bot, cid: int, session: Session, user_content: str):
 
                 # Status update
                 if itr == 1:
-                    mid = await _edit(bot, cid, mid, _think())
+                    mid = await _edit(bot, cid, mid, _live())
                 else:
-                    mid = await _edit(bot, cid, mid, _think(f"🔄 Iterasi ke-{itr}..."))
+                    mid = await _edit(bot, cid, mid, _live(f"🔄 Iterasi ke-{itr}..."))
 
                 # AI call (cancel-aware)
                 try:
                     resp = await ai_call_with_cancel(msgs, session.cancel_event)
                 except Exception as e:
                     mid = await _edit(bot, cid, mid,
-                        _think(f"⚠️ <b>AI Error:</b>\n<code>{esc(str(e)[:300])}</code>\n🔄 Auto-retry..."))
+                        _live(f"⚠️ <b>AI Error:</b>\n<code>{esc(str(e)[:300])}</code>\n🔄 Auto-retry..."))
                     await asyncio.sleep(2)
                     continue
 
@@ -1994,7 +2032,7 @@ async def _process(bot, cid: int, session: Session, user_content: str):
                 stop_all, stop_ids = _extract_stops(resp)
                 if stop_all:
                     stopped = _stop_all_scripts()
-                    mid = await _edit(bot, cid, mid, _think(f"⛔ Stopped {len(stopped)} scripts"))
+                    mid = await _edit(bot, cid, mid, _live(f"⛔ Stopped {len(stopped)} scripts"))
                     memory_mgr.log_message(uid, "user", f"[System] Stopped all scripts: {', '.join(stopped)}")
                 for sid in stop_ids:
                     ok = _stop_script(sid)
@@ -2039,7 +2077,7 @@ async def _process(bot, cid: int, session: Session, user_content: str):
                     web_outputs = []
 
                     for wq, wmax in web_searches:
-                        mid = await _edit(bot, cid, mid, _think(f"🔍 Searching: {esc(wq[:80])}..."))
+                        mid = await _edit(bot, cid, mid, _live(f"🔍 Searching: {esc(wq[:80])}..."))
                         try:
                             sr = await asyncio.to_thread(_web_search, wq, wmax)
                             web_outputs.append(f"[SEARCH RESULT: {wq}]\n{sr}")
@@ -2047,7 +2085,7 @@ async def _process(bot, cid: int, session: Session, user_content: str):
                             web_outputs.append(f"[SEARCH ERROR: {wq}] {e}")
 
                     for wu in web_scrapes:
-                        mid = await _edit(bot, cid, mid, _think(f"🌐 Scraping: {esc(wu[:80])}..."))
+                        mid = await _edit(bot, cid, mid, _live(f"🌐 Scraping: {esc(wu[:80])}..."))
                         try:
                             sc = await asyncio.to_thread(_web_scrape, wu.strip())
                             web_outputs.append(f"[SCRAPE RESULT: {wu}]\n{sc}")
@@ -2055,7 +2093,7 @@ async def _process(bot, cid: int, session: Session, user_content: str):
                             web_outputs.append(f"[SCRAPE ERROR: {wu}] {e}")
 
                     for wds in deep_scans:
-                        mid = await _edit(bot, cid, mid, _think(f"🔬 Deep scanning: {esc(wds[:80])}..."))
+                        mid = await _edit(bot, cid, mid, _live(f"🔬 Deep scanning: {esc(wds[:80])}..."))
                         try:
                             ds = await asyncio.to_thread(_deep_scan, wds.strip())
                             web_outputs.append(f"[DEEP_SCAN RESULT: {wds}]\n{ds}")
@@ -2071,28 +2109,64 @@ async def _process(bot, cid: int, session: Session, user_content: str):
                 # ── SUB-AGENTS ────────────────────────────────
                 sub_agent_tasks = _extract_sub_agents(resp)
                 if sub_agent_tasks:
+                    # Register each sub-agent in live display
+                    sa_base = len(session.live_items)
+                    for i, task in enumerate(sub_agent_tasks):
+                        sa_name = re.sub(r'[^a-zA-Z0-9_ ]', '', task)[:25].strip().replace(' ', '_') or f"task_{i+1}"
+                        session.live_items.append({
+                            "id": f"SA-{i+1:02d}", "type": "sub",
+                            "name": sa_name, "icon": "⏳", "status": "Menunggu..."
+                        })
                     mid = await _edit(bot, cid, mid,
-                        _think(f"🤖 Menjalankan {len(sub_agent_tasks)} sub-agent(s) secara selari..."))
+                        _live(f"🤖 {len(sub_agent_tasks)} sub-agent(s) selari..."))
+
                     context_for_sub = _clean_text(resp)[:3000]
+
+                    # Progress callback — updates live display per sub-agent
+                    async def _sa_progress(idx, status, _err=None):
+                        nonlocal mid
+                        item = session.live_items[sa_base + idx]
+                        if status == "start":
+                            item["icon"] = "⚡"
+                            item["status"] = "Sedang jalan..."
+                        elif status == "done":
+                            item["icon"] = "✅"
+                            item["status"] = "Selesai"
+                        elif status == "error":
+                            item["icon"] = "❌"
+                            item["status"] = "Error"
+                        mid = await _edit(bot, cid, mid, _live(f"🤖 Sub-agents..."))
+
                     combined_sub = await run_sub_agents_parallel(
-                        sub_agent_tasks, context_for_sub, uid)
+                        sub_agent_tasks, context_for_sub, uid,
+                        on_progress=_sa_progress)
                     memory_mgr.log_message(uid, "user", combined_sub[:8000])
 
                     # Process sub-agent code blocks too
                     sub_code = _extract_code(combined_sub)
                     sub_sends = _extract_sends(combined_sub)
                     if sub_code or sub_sends:
-                        # Execute sub-agent code
                         for code_text, lang in sub_code:
                             name = _auto_script_name(code_text)
-                            mid = await _edit(bot, cid, mid, _think(f"⚡ Sub-agent script: {esc(name)}"))
+                            sc_id = f"SA-SC-{hashlib.md5(code_text.encode()).hexdigest()[:4]}"
+                            session.live_items.append({
+                                "id": sc_id, "type": "script",
+                                "name": name, "icon": "⚡", "status": "Running..."
+                            })
+                            mid = await _edit(bot, cid, mid, _live(f"⚡ Sub-agent script"))
                             entry = await asyncio.to_thread(
                                 _exec_script_sync, code_text, lang, name, QUICK_TIMEOUT)
-                            parts = [f"[Sub-agent script {entry.sid} — {entry.status}]"]
+                            # Update live display
+                            for it in session.live_items:
+                                if it["id"] == sc_id:
+                                    it["icon"] = "✅" if entry.status == "done" else "❌"
+                                    it["status"] = "Selesai" if entry.status == "done" else "Gagal"
+                                    break
+                            mid = await _edit(bot, cid, mid, _live())
+                            parts = [f"[Sub-agent script {entry.sid} ({name}) — {entry.status}]"]
                             if entry.stdout: parts.append(f"STDOUT:\n{entry.stdout[:5000]}")
                             if entry.stderr: parts.append(f"STDERR:\n{entry.stderr[:2000]}")
                             memory_mgr.log_message(uid, "user", "\n".join(parts))
-                        # Send sub-agent files
                         await _process_send_files(bot, cid, sub_sends, _sent_paths)
 
                     if not _extract_code(resp):
@@ -2116,25 +2190,37 @@ async def _process(bot, cid: int, session: Session, user_content: str):
                             syn = _syntax_ok(code_text)
                             if syn:
                                 mid = await _edit(bot, cid, mid,
-                                    _think(f"🔧 Syntax error — auto-fix..."))
+                                    _live(f"🔧 Syntax error — auto-fix..."))
                                 outputs.append(f"[Block {i+1} — SYNTAX ERROR]\n{syn}\nFix the code.")
                                 continue
 
                         await asyncio.to_thread(_auto_install_modules, code_text)
                         name = _auto_script_name(code_text)
 
+                        # Register script in live display
+                        entry_preview_sid = hashlib.md5(code_text.encode()).hexdigest()[:6]
+                        sc_display_id = f"SC-{entry_preview_sid}"
+                        session.live_items.append({
+                            "id": sc_display_id, "type": "script",
+                            "name": name, "icon": "⚡", "status": "Running..."
+                        })
+
                         cl = code_text.lower()
                         if any(x in cl for x in ['requests.get', 'httpx.get', 'cloudscraper', 'scrape']):
-                            op_icon = "🌐 <b>Scraping web...</b>"
+                            op_desc = "Scraping web"
                         elif 'pip install' in cl:
-                            op_icon = "📦 <b>Installing deps...</b>"
+                            op_desc = "Installing deps"
                         elif any(x in cl for x in ['download', 'wget']):
-                            op_icon = "⬇️ <b>Downloading...</b>"
+                            op_desc = "Downloading"
                         else:
-                            op_icon = f"⚡ <b>Running {lang}...</b>"
+                            op_desc = f"Running {lang}"
 
-                        mid = await _edit(bot, cid, mid,
-                            _think(f"{op_icon}\n📋 Script: <code>{name}</code>"))
+                        # Update live display
+                        for it in session.live_items:
+                            if it["id"] == sc_display_id:
+                                it["status"] = op_desc
+                                break
+                        mid = await _edit(bot, cid, mid, _live())
 
                         entry = await asyncio.to_thread(
                             _exec_script_sync, code_text, lang, name, QUICK_TIMEOUT)
@@ -2149,17 +2235,20 @@ async def _process(bot, cid: int, session: Session, user_content: str):
                         if entry.status == "running":
                             actually_running = entry.proc and entry.proc.poll() is None
                             if actually_running:
-                                # Background it — start watcher
                                 asyncio.create_task(
                                     _watch_script_async(entry, bot, cid, session))
+                                for it in session.live_items:
+                                    if it["id"] == sc_display_id:
+                                        it["icon"] = "🔄"
+                                        it["status"] = "Background"
+                                        break
                                 mid = await _edit(bot, cid, mid,
-                                    _think(f"⚡ Script di background: <code>{entry.sid}</code>\n💬 Boleh terus chat."))
+                                    _live(f"💬 Boleh terus chat."))
                                 outputs.append(
                                     f"[Script {entry.sid} ({name}) — running in background]\n"
                                     "Inform user they can continue chatting.")
                                 break
                             else:
-                                # Already exited
                                 await asyncio.sleep(0.3)
                                 try:
                                     out_p = SCRIPTS_DIR / f"{entry.sid}.stdout"
@@ -2172,12 +2261,17 @@ async def _process(bot, cid: int, session: Session, user_content: str):
                                 entry.ended = datetime.datetime.now()
                                 _save_scripts_meta()
 
-                        if entry.status == "error":
-                            mid = await _edit(bot, cid, mid,
-                                _think(f"❌ Script gagal — <code>{entry.sid}</code>\n🔧 AI sedang baiki..."))
-                        elif entry.status == "done":
-                            mid = await _edit(bot, cid, mid,
-                                _think(f"✅ Script selesai — <code>{entry.sid}</code>"))
+                        # Update live display with result
+                        for it in session.live_items:
+                            if it["id"] == sc_display_id:
+                                if entry.status == "error":
+                                    it["icon"] = "❌"
+                                    it["status"] = "Gagal → 🔧 Baiki..."
+                                elif entry.status == "done":
+                                    it["icon"] = "✅"
+                                    it["status"] = "Selesai"
+                                break
+                        mid = await _edit(bot, cid, mid, _live())
 
                         parts = [f"[Script {entry.sid} ({name}) — {entry.status}]"]
                         if entry.stdout: parts.append(f"STDOUT:\n{entry.stdout[:8000]}")
@@ -2218,7 +2312,7 @@ async def _process(bot, cid: int, session: Session, user_content: str):
             except Exception as e:
                 log.error(f"Processing error: {e}", exc_info=True)
                 mid = await _edit(bot, cid, mid,
-                    _think(f"⚠️ Error: <code>{esc(str(e)[:200])}</code>\n🔄 Retry..."))
+                    _live(f"⚠️ Error: <code>{esc(str(e)[:200])}</code>\n🔄 Retry..."))
                 await asyncio.sleep(2)
                 if itr > 30:
                     await _edit(bot, cid, mid,
@@ -2228,6 +2322,8 @@ async def _process(bot, cid: int, session: Session, user_content: str):
     finally:
         session.busy = False
         session.cancel_event.clear()
+        session.live_items = []
+        session.task_desc = ""
 
 
 async def _watch_script_async(entry: ScriptEntry, bot, cid: int, session: Session):
@@ -2644,7 +2740,28 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             session.busy = False
             session.cancel_event.clear()
         else:
-            await update.message.reply_text("⏳ AI sedang memproses. Sila tunggu atau guna /stop.")
+            # Natural language stop detection
+            _stop_words = [
+                "matikan", "stop", "berhenti", "cancel", "hentikan",
+                "diam", "tutup", "abort", "halt", "batalkan",
+                "off", "tamat", "sudah", "enough", "quit",
+            ]
+            lower = text.strip().lower()
+            if any(sw in lower for sw in _stop_words):
+                session.cancel_event.set()
+                stopped = _stop_all_scripts()
+                n = len(stopped)
+                await update.message.reply_text(
+                    f"⛔ <b>Menghentikan semua proses...</b>"
+                    + (f"\n🛑 {n} script dihentikan." if n else ""),
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+            await update.message.reply_text(
+                "⏳ AI sedang memproses. Sila tunggu, hantar /stop, "
+                "atau taip <b>\"matikan\"</b> untuk hentikan.",
+                parse_mode=ParseMode.HTML,
+            )
             return
 
     user_content = reply_ctx + text
@@ -2674,8 +2791,15 @@ async def on_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     session = _sess(uid)
 
     if session.busy:
-        await update.message.reply_text("⏳ AI sedang memproses.")
-        return
+        if session.is_stale_busy(300):
+            session.busy = False
+            session.cancel_event.clear()
+        else:
+            await update.message.reply_text(
+                "⏳ AI sedang memproses. Sila tunggu atau guna /stop.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
 
     msg = update.message
     file_obj = (msg.document or msg.photo[-1] if msg.photo else
@@ -2850,6 +2974,7 @@ def main():
         Application.builder()
         .token(TOKEN)
         .post_init(post_init)
+        .concurrent_updates(True)
         .read_timeout(30)
         .write_timeout(30)
         .connect_timeout(30)
