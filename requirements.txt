@@ -1,0 +1,17 @@
+python-telegram-bot==21.10
+httpx[http2]
+aiohttp
+cloudscraper
+requests
+beautifulsoup4
+pandas
+numpy
+Pillow
+openpyxl
+lxml
+lxml_html_clean
+aiofiles
+chardet
+ddgs
+trafilatura
+scikit-learn

@@ -1,0 +1,58 @@
+name: AI Automation Bot
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '0 */5 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: bot-runner
+  cancel-in-progress: true
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 310
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Create workspace directories
+        run: |
+          mkdir -p workspace/.scripts workspace/uploads chat_history memory
+
+      - name: Restore workspace from cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            memory/
+            workspace/
+            chat_history/
+          key: bot-workspace-${{ github.run_id }}
+          restore-keys: |
+            bot-workspace-
+
+      - name: Run bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          OWNER_ID: ${{ secrets.OWNER_ID }}
+          CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
+          CHANNEL_LINK: ${{ secrets.CHANNEL_LINK }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          RUN_DURATION: "18000"
+        run: python bot.py
