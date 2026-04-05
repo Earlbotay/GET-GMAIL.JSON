@@ -1,0 +1,45 @@
+name: Run Bot
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */5 * * *"   # every 5 hours
+
+concurrency:
+  group: bot-runner
+  cancel-in-progress: true   # kill old run when new one starts
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 305
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install cloudflared
+        run: |
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
+          chmod +x cloudflared
+          sudo mv cloudflared /usr/local/bin/
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Setup credentials
+        env:
+          CREDENTIALS_JSON: ${{ secrets.CREDENTIALS_JSON }}
+        run: echo "$CREDENTIALS_JSON" > credentials.json
+
+      - name: Run bot
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          OWNER_ID: ${{ secrets.OWNER_ID }}
+        run: python bot.py
