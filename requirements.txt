@@ -4,3 +4,4 @@ google-auth-oauthlib==1.1.0
 requests==2.31.0
 flask==3.0.0
 urllib3<2
+setuptools<70
